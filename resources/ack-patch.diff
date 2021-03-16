@@ -1,0 +1,139 @@
+diff --git a/doc/examples/quic/quic_frame.ivy b/doc/examples/quic/quic_frame.ivy
+index 63c5e1c..e16e1e8 100644
+--- a/doc/examples/quic/quic_frame.ivy
++++ b/doc/examples/quic/quic_frame.ivy
+@@ -362,6 +362,7 @@ object frame = {
+ #   has been sent to aid C with data D, and has not yet been responded
+ #   to. QUESTION: should path responses be resent, or should the client
+ #   wait for a resent path challenge?
++
+ #
+ # - The function `conn_total_data(C)` represents the total number of stream
+ #   bytes received by aid `C`.
+@@ -462,6 +463,7 @@ object frame = {
+             };
+             require f.ack_blocks.end > 0;
+             var some_new_ack := false;
++            var some_non_ack := false; # will be set to true if a non-ack packet is part of the acknowledged packets
+             while idx < f.ack_blocks.end {
+                 var ack_block := f.ack_blocks.value(idx);
+                 require idx > 0 -> ack_block.gap < last - 1;
+@@ -471,6 +473,9 @@ object frame = {
+ 		var jdx := last;
+ 		while jdx <= upper {
+                     require sent_pkt(dcid,e,jdx);  # [1]
++                    if ~ack_only(dcid,e,jdx) {
++                        some_non_ack := true;
++                    };
+                     if pkt_has_close(dcid,e,jdx) {
+                         conn_draining(scid) := true  # [5]
+                     };
+@@ -483,6 +488,9 @@ object frame = {
+ #                acked_pkt(dcid,N) := (last <= N & N <= upper) | acked_pkt(dcid,N);  # [2]
+                 idx := idx.next;
+             };
++            if ~_generating {
++                require some_non_ack; # the server should not acknowledge ack-only packets
++            };
+             if _generating {
+                 require some_new_ack;
+             }
+@@ -1176,6 +1184,7 @@ object frame = { ...
+ # 
+ # The argument probing indicates that the frame is a probing frame, according to [9.1]
+ # of the transport document( as of draft 23)
++
+ action enqueue_frame(scid:cid, f:frame, e:quic_packet_type, probing:bool) = {
+     queued_frames(scid) := queued_frames(scid).append(f);
+     num_queued_frames(scid) := queued_frames(scid).end;
+diff --git a/doc/examples/quic/quic_packet.ivy b/doc/examples/quic/quic_packet.ivy
+index 53b0468..bd7ccbc 100644
+--- a/doc/examples/quic/quic_packet.ivy
++++ b/doc/examples/quic/quic_packet.ivy
+@@ -169,6 +169,8 @@ relation conn_draining(C:cid)
+ relation draining_pkt_sent(C:cid)
+ function last_pkt_num(C:cid,L:quic_packet_type) : pkt_num
+ relation sent_pkt(C:cid,L:quic_packet_type,N:pkt_num)
++# here we add a relation that tracks which packets contain only acks:
++relation ack_only(C:cid,L:quic_packet_type,N:pkt_num)
+ relation acked_pkt(C:cid,L:quic_packet_type,N:pkt_num)
+ function max_acked(C:cid,L:quic_packet_type) : pkt_num
+ function ack_credit(C:cid) : pkt_num
+@@ -324,6 +326,11 @@ around packet_event(src:ip.endpoint,dst:ip.endpoint,pkt:quic_packet) {
+ 
+     require ~sent_pkt(scid,pkt.ptype,pkt.seq_num);  # [4]
+     sent_pkt(scid,pkt.ptype,pkt.seq_num) := true;  # [1]
++    if _generating {
++        if ~queued_non_ack(scid) {
++            ack_only(scid,pkt.ptype,pkt.seq_num) := true;
++        }
++    };
+ 
+     # The payload may not be empty
+ 
+@@ -415,6 +422,7 @@ around packet_event(src:ip.endpoint,dst:ip.endpoint,pkt:quic_packet) {
+     if queued_ack_eliciting(scid) {
+        ack_credit(dcid) := ack_credit(dcid) + 1;
+     };
++
+     if ~queued_non_ack(scid) {
+        ack_credit(scid) := ack_credit(scid) - 1;
+     };
+@@ -511,6 +519,7 @@ action handle_tls_extensions
+      is_client_hello:bool) =
+ {
+ 
++
+     # We process the extensions in a message in order.
+ 
+     var idx := exts.begin;
+diff --git a/doc/examples/quic/quic_server_test.ivy b/doc/examples/quic/quic_server_test.ivy
+index cb85b00..3b4eb08 100644
+--- a/doc/examples/quic/quic_server_test.ivy
++++ b/doc/examples/quic/quic_server_test.ivy
+@@ -438,12 +438,12 @@ around client_send_event {
+ export frame.ack.handle
+ export frame.stream.handle
+ export frame.crypto.handle
+-export frame.path_response.handle
++#export frame.path_response.handle
+ export packet_event
+ export client_send_event
+ export tls_recv_event
+ #export frame.new_connection_id.handle
+-export frame.retire_connection_id.handle
++#export frame.retire_connection_id.handle
+ #export frame.rst_stream.handle
+ #export frame.max_stream_id.handle
+ #export frame.connection_close.handle
+diff --git a/doc/examples/quic/test/test.py b/doc/examples/quic/test/test.py
+index 23b7073..f6b3309 100644
+--- a/doc/examples/quic/test/test.py
++++ b/doc/examples/quic/test/test.py
+@@ -5,6 +5,7 @@ import os
+ import sys
+ import imp
+ import subprocess
++import signal
+ import re
+ import time
+ import signal
+@@ -200,6 +201,7 @@ class Test(object):
+                             server.terminate()
+                         raise KeyboardInterrupt
+                     if run:
++
+                         server.terminate()
+                         retcode = server.wait()
+                         if retcode != -15 and retcode != 0:  # if not exit on SIGTERM...
+@@ -264,7 +266,9 @@ class IvyTest(Test):
+     def command(self,seq):
+         import platform
+         timeout_cmd = '' if platform.system() == 'Windows' else 'timeout {} '.format(time)
+-        return ' '.join(['{}./build/{} seed={} the_cid={} {}'.format(timeout_cmd,self.name,seq,2*seq,'' if test_client else 'server_cid={} client_port={} client_port_alt={}'.format(2*seq+1,2*seq+4987,2*seq+4988))] + extra_args)
++        import random
++        seed = random.randint(0,255)
++        return ' '.join(['{}./build/{} seed={} the_cid={} {}'.format(timeout_cmd,self.name,seed,2*seq,'' if test_client else 'server_cid={} client_port={} client_port_alt={}'.format(2*seq+1,2*seq+4987,2*seq+4988))] + extra_args)
+ 
+ all_tests = []
+ 
